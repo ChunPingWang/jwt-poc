@@ -9,14 +9,15 @@
 1. [什麼是 JWT？](#什麼是-jwt)
 2. [為什麼需要 JWT？](#為什麼需要-jwt)
 3. [JWT 的結構](#jwt-的結構)
-4. [認證流程圖解](#認證流程圖解)
-5. [Refresh Token 機制](#refresh-token-機制)
-6. [專案架構總覽](#專案架構總覽)
-7. [核心程式碼逐行解說](#核心程式碼逐行解說)
-8. [環境需求與啟動方式](#環境需求與啟動方式)
-9. [API 測試教學（手把手）](#api-測試教學手把手)
-10. [常見問題 FAQ](#常見問題-faq)
-11. [延伸學習資源](#延伸學習資源)
+4. [HS256 vs RS256 簽章演算法](#hs256-vs-rs256-簽章演算法)
+5. [認證流程圖解](#認證流程圖解)
+6. [Refresh Token 機制](#refresh-token-機制)
+7. [專案架構總覽](#專案架構總覽)
+8. [核心程式碼逐行解說](#核心程式碼逐行解說)
+9. [環境需求與啟動方式](#環境需求與啟動方式)
+10. [API 測試教學（手把手）](#api-測試教學手把手)
+11. [常見問題 FAQ](#常見問題-faq)
+12. [延伸學習資源](#延伸學習資源)
 
 ---
 
@@ -86,13 +87,14 @@ eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJyZXgiLCJyb2xlIjoiQURNSU4ifQ.xxxS
 
 ### 1. Header（標頭）
 
-描述這個 Token 使用的演算法和類型。
+描述這個 Token 使用的演算法和類型。本專案支援兩種演算法：
 
 ```json
-{
-  "alg": "HS256",    // 簽名演算法：HMAC-SHA256
-  "typ": "JWT"       // Token 類型：JWT
-}
+// HS256（對稱式）
+{ "alg": "HS256", "typ": "JWT" }
+
+// RS256（非對稱式）
+{ "alg": "RS256", "typ": "JWT" }
 ```
 
 經過 **Base64Url 編碼** 後變成：`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9`
@@ -155,6 +157,108 @@ block-beta
 
 ```
 最終 Token = Base64(Header) + "." + Base64(Payload) + "." + Signature
+```
+
+---
+
+## HS256 vs RS256 簽章演算法
+
+本專案支援兩種 JWT 簽章演算法，透過 `jwt.algorithm` 設定值切換。
+
+### 核心差異
+
+```mermaid
+graph LR
+    subgraph HS256["HS256（對稱式）"]
+        direction TB
+        SECRET["🔑 同一把 Secret Key"]
+        SECRET -->|簽名| SIGN_H["Server 產生 JWT"]
+        SECRET -->|驗證| VERIFY_H["Server 驗證 JWT"]
+    end
+
+    subgraph RS256["RS256（非對稱式）"]
+        direction TB
+        PRIV["🔐 Private Key"]
+        PUB["🔓 Public Key"]
+        PRIV -->|簽名| SIGN_R["Server 產生 JWT"]
+        PUB -->|驗證| VERIFY_R["任何服務驗證 JWT"]
+    end
+
+    style HS256 fill:#dbeafe,color:#000
+    style RS256 fill:#dcfce7,color:#000
+    style SECRET fill:#fbbf24,color:#000
+    style PRIV fill:#f87171,color:#fff
+    style PUB fill:#4ade80,color:#000
+```
+
+| 比較 | HS256（對稱式） | RS256（非對稱式） |
+|------|---------------|-----------------|
+| 密鑰 | 同一把 Secret Key | Private Key + Public Key |
+| 簽名方 | 持有 Secret 的服務 | 持有 Private Key 的服務 |
+| 驗證方 | 持有 Secret 的服務 | 任何持有 Public Key 的服務 |
+| 安全性 | Secret 洩漏 = 可偽造 Token | Public Key 洩漏也無法偽造 |
+| 適用場景 | 單一服務 | 微服務架構 |
+| 效能 | 較快 | 較慢（RSA 運算） |
+
+### RS256 在微服務中的優勢
+
+```mermaid
+graph TD
+    subgraph "HS256 的困境"
+        AUTH_H["認證服務<br/>🔑 Secret Key"] -->|"必須共享 Secret"| SVC1_H["服務 A<br/>🔑 Secret Key"]
+        AUTH_H -->|"必須共享 Secret"| SVC2_H["服務 B<br/>🔑 Secret Key"]
+        AUTH_H -->|"必須共享 Secret"| SVC3_H["服務 C<br/>🔑 Secret Key"]
+    end
+
+    subgraph "RS256 的解決方案"
+        AUTH_R["認證服務<br/>🔐 Private Key"] -->|"只分發 Public Key"| SVC1_R["服務 A<br/>🔓 Public Key"]
+        AUTH_R -->|"只分發 Public Key"| SVC2_R["服務 B<br/>🔓 Public Key"]
+        AUTH_R -->|"只分發 Public Key"| SVC3_R["服務 C<br/>🔓 Public Key"]
+    end
+
+    style AUTH_H fill:#fbbf24,color:#000
+    style AUTH_R fill:#4ade80,color:#000
+```
+
+> HS256 需要每個服務都持有 Secret Key（任何一個服務被入侵，攻擊者就能偽造 Token）。RS256 只需認證服務持有 Private Key，其他服務只需 Public Key（被入侵也無法偽造）。
+
+### 如何切換演算法
+
+在 `application.properties` 中修改：
+
+```properties
+# 切換為 RS256
+jwt.algorithm=RS256
+
+# RS256 需要的金鑰檔案（已內建於專案中）
+jwt.rsa.private-key-location=keys/private.pem
+jwt.rsa.public-key-location=keys/public.pem
+```
+
+```properties
+# 切換回 HS256（預設）
+jwt.algorithm=HS256
+
+# HS256 需要的密鑰
+jwt.secret=ThisIsAVeryLongSecretKeyForHS256AlgorithmAtLeast256BitsLong!!
+```
+
+> 切換演算法不需要修改任何程式碼 — 只需改設定檔。這是因為 `JwtTokenProvider` 在啟動時根據設定自動選擇對應的簽名/驗證策略。
+
+### 金鑰管理
+
+本專案在 `src/main/resources/keys/` 中附帶了一對 RSA 2048-bit PEM 金鑰供 PoC 使用。
+
+> **重要**：正式環境中**絕對不要**將私鑰提交到版本控制。應使用環境變數、Vault 或 Key Management Service。
+
+如需自行產生新的金鑰對：
+
+```bash
+# 產生 RSA 2048-bit 私鑰（PKCS#8 格式，Java 相容）
+openssl genpkey -algorithm RSA -out private.pem -pkeyopt rsa_keygen_bits:2048
+
+# 從私鑰導出公鑰
+openssl rsa -in private.pem -pubout -out public.pem
 ```
 
 ---
@@ -382,6 +486,12 @@ graph LR
 ### 目錄結構
 
 ```
+src/main/resources/
+├── application.properties              # 設定檔（含 jwt.algorithm 切換）
+└── keys/                               # RSA 金鑰對（PoC 用）
+    ├── private.pem                     #   RSA 私鑰（PKCS#8 PEM）
+    └── public.pem                      #   RSA 公鑰（X.509 PEM）
+
 src/main/java/com/example/jwtpoc/
 ├── JwtPocApplication.java              # Spring Boot 啟動入口
 │
@@ -425,7 +535,7 @@ src/main/java/com/example/jwtpoc/
 └── infrastructure/                     # 【基礎設施層】技術實作
     └── security/
         ├── SecurityConfig.java         #   Spring Security 配置
-        ├── JwtTokenProvider.java       #   JWT 產生 / 驗證 / 解析
+        ├── JwtTokenProvider.java       #   JWT 產生 / 驗證 / 解析（HS256 + RS256）
         └── JwtAuthenticationFilter.java#   JWT 請求過濾器
 ```
 
@@ -435,31 +545,40 @@ src/main/java/com/example/jwtpoc/
 
 ### 1. JWT Token 產生器 — `JwtTokenProvider.java`
 
-這是整個 JWT 機制的核心，負責 Token 的產生、驗證與解析。
+這是整個 JWT 機制的核心，負責 Token 的產生、驗證與解析。支援 HS256 和 RS256 雙演算法。
 
 ```java
-// 產生 JWT Token
-public String generateToken(String username, String role) {
-    Date now = new Date();
-    Date expiry = new Date(now.getTime() + expirationMs);
+// 建構時根據 jwt.algorithm 設定自動選擇簽名策略
+if ("RS256".equals(algorithm)) {
+    // RS256: 私鑰簽名，公鑰驗證
+    this.signingKey = loadPrivateKey(privateKeyLocation);
+    this.jwtParser = Jwts.parser().verifyWith(loadPublicKey(publicKeyLocation)).build();
+} else {
+    // HS256: 同一把密鑰簽名和驗證
+    SecretKey hmacKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+    this.signingKey = hmacKey;
+    this.jwtParser = Jwts.parser().verifyWith(hmacKey).build();
+}
+```
 
-    String token = Jwts.builder()
+```java
+// 產生 JWT Token — .signWith() 根據 Key 類型自動選擇演算法
+public String generateToken(String username, String role) {
+    return Jwts.builder()
             .subject(username)              // 設定 Payload 的 sub（主體）
             .claim("role", role)             // 設定自訂聲明：角色
             .issuer(issuer)                  // 設定 Payload 的 iss（簽發者）
             .issuedAt(now)                   // 設定 Payload 的 iat（簽發時間）
             .expiration(expiry)              // 設定 Payload 的 exp（過期時間）
-            .signWith(secretKey)             // 用密鑰簽名（自動選用 HS256）
+            .signWith(signingKey)            // SecretKey → HS256, PrivateKey → RS256
             .compact();                      // 組合為 header.payload.signature
-
-    return token;
 }
 ```
 
 **初學者重點**：
 - `Jwts.builder()` 是 JJWT 函式庫提供的建構器模式
-- `.signWith(secretKey)` 是安全的關鍵 — 沒有密鑰就無法偽造 Token
-- `.compact()` 最終將三個部分用 `.` 串接成一個字串
+- `.signWith(signingKey)` 會根據 Key 的類型自動選擇演算法（`SecretKey` → HS256, `PrivateKey` → RS256）
+- 驗證時使用預先建構好的 `JwtParser`，無需在每次請求中判斷演算法
 
 ```java
 // 驗證 JWT Token
@@ -660,6 +779,17 @@ Started JwtPocApplication in 2.xxx seconds
 
 伺服器預設在 `http://localhost:8080` 運行。
 
+### 切換簽章演算法
+
+專案預設使用 HS256。如需體驗 RS256，修改 `application.properties`：
+
+```bash
+# 使用 RS256 啟動
+mvn spring-boot:run -Djwt.algorithm=RS256
+
+# 或直接修改 application.properties 中的 jwt.algorithm=RS256
+```
+
 ### 執行測試
 
 ```bash
@@ -766,7 +896,7 @@ echo $TOKEN | cut -d'.' -f1 | base64 -d 2>/dev/null && echo
 echo $TOKEN | cut -d'.' -f2 | base64 -d 2>/dev/null && echo
 ```
 
-你會看到類似的輸出：
+你會看到類似的輸出（演算法取決於 `jwt.algorithm` 設定）：
 ```json
 {"alg":"HS256"}
 {"sub":"alice","role":"USER","iss":"jwt-poc-app","iat":1700000000,"exp":1700003600}
@@ -924,7 +1054,7 @@ curl -s -X POST http://localhost:8080/api/auth/refresh \
 | HS256 | 對稱式 | 同一把密鑰簽名和驗證 | 單一服務，簡單場景 |
 | RS256 | 非對稱式 | 私鑰簽名，公鑰驗證 | 微服務架構，多服務驗證 |
 
-本專案使用 HS256，因為是單一服務的 PoC。正式環境如果是微服務架構，建議考慮 RS256。
+本專案**兩種都支援**，透過 `jwt.algorithm` 設定值切換（預設 HS256）。詳見 [HS256 vs RS256 簽章演算法](#hs256-vs-rs256-簽章演算法) 章節。
 
 ### Q4: Token 過期了怎麼辦？
 
@@ -969,10 +1099,10 @@ H2 是一個嵌入式的記憶體資料庫，專案啟動時自動建立，關�
 - [Lombok](https://projectlombok.org/) — Java 程式碼簡化工具
 
 ### 進階主題
-- **RS256 非對稱加密**：適用於微服務架構
 - **OAuth 2.0**：更完整的授權框架
 - **Token 黑名單**：搭配 Redis 實作 Access Token 撤銷
 - **Rate Limiting**：防止暴力破解登入
+- **JWKS (JSON Web Key Set)**：動態公鑰分發機制
 
 ---
 
