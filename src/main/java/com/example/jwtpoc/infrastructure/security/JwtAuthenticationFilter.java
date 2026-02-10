@@ -5,6 +5,8 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
+import com.example.jwtpoc.application.port.out.TokenBlacklistRepository;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
@@ -37,9 +39,12 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     private static final String BEARER_PREFIX = "Bearer ";
 
     private final JwtTokenProvider jwtTokenProvider;
+    private final TokenBlacklistRepository tokenBlacklistRepository;
 
-    public JwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider) {
+    public JwtAuthenticationFilter(JwtTokenProvider jwtTokenProvider,
+                                   TokenBlacklistRepository tokenBlacklistRepository) {
         this.jwtTokenProvider = jwtTokenProvider;
+        this.tokenBlacklistRepository = tokenBlacklistRepository;
     }
 
     @Override
@@ -52,18 +57,24 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         String token = extractToken(request);
 
         if (token != null && jwtTokenProvider.validateToken(token)) {
-            // Step 7: 驗證 JWT 成功 → 設定 SecurityContext
-            String username = jwtTokenProvider.getUsernameFromToken(token);
-            String role = jwtTokenProvider.getRoleFromToken(token);
+            // 檢查 Token 是否已被列入黑名單（登出後撤銷）
+            String jti = jwtTokenProvider.getJtiFromToken(token);
+            if (jti != null && tokenBlacklistRepository.isBlacklisted(jti)) {
+                log.debug("Token is blacklisted (jti={}), skipping authentication", jti);
+            } else {
+                // Step 7: 驗證 JWT 成功 → 設定 SecurityContext
+                String username = jwtTokenProvider.getUsernameFromToken(token);
+                String role = jwtTokenProvider.getRoleFromToken(token);
 
-            var authorities = List.of(new SimpleGrantedAuthority("ROLE_" + role));
+                var authorities = List.of(new SimpleGrantedAuthority("ROLE_" + role));
 
-            var authentication = new UsernamePasswordAuthenticationToken(
-                    username, null, authorities);
+                var authentication = new UsernamePasswordAuthenticationToken(
+                        username, null, authorities);
 
-            SecurityContextHolder.getContext().setAuthentication(authentication);
+                SecurityContextHolder.getContext().setAuthentication(authentication);
 
-            log.debug("JWT authenticated user: {}, role: {}", username, role);
+                log.debug("JWT authenticated user: {}, role: {}", username, role);
+            }
         }
 
         // 繼續 Filter Chain

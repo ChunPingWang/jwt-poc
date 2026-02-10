@@ -143,13 +143,14 @@ class RefreshTokenFlowIntegrationTest {
 
     @Test
     @Order(6)
-    @DisplayName("登出成功 - 撤銷 Refresh Token")
+    @DisplayName("登出成功 - 撤銷 Refresh Token 並將 Access Token 加入黑名單")
     void shouldLogoutSuccessfully() throws Exception {
         var request = new LogoutRequest(refreshToken);
 
         mockMvc.perform(post("/api/auth/logout")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(request)))
+                        .content(objectMapper.writeValueAsString(request))
+                        .header("Authorization", "Bearer " + accessToken))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.message").value("Logged out successfully"));
     }
@@ -168,12 +169,12 @@ class RefreshTokenFlowIntegrationTest {
 
     @Test
     @Order(8)
-    @DisplayName("登出後 Access Token 仍然有效（JWT 是 stateless 的）")
-    void shouldStillAccessWithAccessTokenAfterLogout() throws Exception {
-        // 這是 JWT 的已知限制：登出只撤銷 Refresh Token，
-        // 已發出的 Access Token 仍然有效直到過期
+    @DisplayName("登出後 Access Token 應被黑名單拒絕")
+    void shouldRejectAccessTokenAfterLogoutDueToBlacklist() throws Exception {
+        // Token Blacklist 解決了 JWT stateless 的限制：
+        // 登出時 Access Token 被加入黑名單，後續請求會被拒絕
         mockMvc.perform(get("/api/protected/profile")
                         .header("Authorization", "Bearer " + accessToken))
-                .andExpect(status().isOk());
+                .andExpect(status().isForbidden());
     }
 }

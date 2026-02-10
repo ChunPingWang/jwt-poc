@@ -6,10 +6,12 @@ import com.example.jwtpoc.application.port.in.LoginResult;
 import com.example.jwtpoc.application.port.in.TokenRefreshUseCase;
 import com.example.jwtpoc.domain.model.User;
 
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
@@ -94,13 +96,23 @@ public class AuthController {
     /**
      * POST /api/auth/logout
      *
-     * 撤銷 Refresh Token，使其無法再用來取得新的 Access Token。
-     * 注意：已發出的 Access Token (JWT) 仍然有效直到過期，
-     * 因為 JWT 是 stateless 的。這是 JWT 架構的已知限制。
+     * 撤銷 Refresh Token 並將 Access Token 加入黑名單。
+     * Access Token 在黑名單中的存活時間等於其剩餘有效期，
+     * 過期後自動清理，不會永久佔用記憶體。
      */
     @PostMapping("/logout")
-    public ResponseEntity<Map<String, String>> logout(@Valid @RequestBody LogoutRequest request) {
-        tokenRefreshUseCase.logout(request.refreshToken());
+    public ResponseEntity<Map<String, String>> logout(@Valid @RequestBody LogoutRequest request,
+                                                      HttpServletRequest httpRequest) {
+        String accessToken = extractAccessToken(httpRequest);
+        tokenRefreshUseCase.logout(request.refreshToken(), accessToken);
         return ResponseEntity.ok(Map.of("message", "Logged out successfully"));
+    }
+
+    private String extractAccessToken(HttpServletRequest request) {
+        String bearerToken = request.getHeader("Authorization");
+        if (StringUtils.hasText(bearerToken) && bearerToken.startsWith("Bearer ")) {
+            return bearerToken.substring(7);
+        }
+        return null;
     }
 }

@@ -20,9 +20,12 @@ public interface TokenRefreshUseCase {
     TokenPair refresh(String refreshToken);
 
     /**
-     * 登出 - 撤銷 Refresh Token
+     * 登出 - 撤銷 Refresh Token 並將 Access Token 加入黑名單
+     *
+     * @param refreshToken Refresh Token
+     * @param accessToken  Access Token (JWT)，將被加入黑名單
      */
-    void logout(String refreshToken);
+    void logout(String refreshToken, String accessToken);
 
     /**
      * 回傳值：一對新的 Token

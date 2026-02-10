@@ -22,11 +22,11 @@ class JwtTokenProviderTest {
     private static final String HS256_SECRET = "ThisIsAVeryLongSecretKeyForHS256AlgorithmAtLeast256BitsLong!!";
 
     private JwtTokenProvider createHs256Provider(long expirationMs) {
-        return new JwtTokenProvider("HS256", HS256_SECRET, "", "", expirationMs, ISSUER);
+        return new JwtTokenProvider("HS256", HS256_SECRET, "", "", expirationMs, ISSUER, "test-key-1");
     }
 
     private JwtTokenProvider createRs256Provider(long expirationMs) {
-        return new JwtTokenProvider("RS256", "", "keys/public.pem", "keys/private.pem", expirationMs, ISSUER);
+        return new JwtTokenProvider("RS256", "", "keys/public.pem", "keys/private.pem", expirationMs, ISSUER, "test-key-1");
     }
 
     // ==========================================
@@ -91,6 +91,26 @@ class JwtTokenProviderTest {
             JwtTokenProvider expiredProvider = createHs256Provider(0);
             String token = expiredProvider.generateToken("rex", "USER");
             assertFalse(expiredProvider.validateToken(token));
+        }
+
+        @Test
+        @DisplayName("產生的 Token 應包含 jti claim（Token 黑名單用）")
+        void shouldIncludeJtiClaim() {
+            String token = provider.generateToken("rex", "USER");
+            String jti = provider.getJtiFromToken(token);
+            assertNotNull(jti, "Token should contain jti (JWT ID) claim");
+            assertFalse(jti.isBlank(), "jti should not be blank");
+        }
+
+        @Test
+        @DisplayName("每次產生的 Token 應有不同的 jti")
+        void shouldGenerateUniqueJti() {
+            String token1 = provider.generateToken("rex", "USER");
+            String token2 = provider.generateToken("rex", "USER");
+            assertNotEquals(
+                    provider.getJtiFromToken(token1),
+                    provider.getJtiFromToken(token2),
+                    "Each token should have a unique jti");
         }
 
         @Test

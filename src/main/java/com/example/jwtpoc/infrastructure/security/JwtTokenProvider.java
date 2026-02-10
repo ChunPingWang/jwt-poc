@@ -22,6 +22,7 @@ import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 import java.util.Date;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 /**
@@ -49,6 +50,8 @@ public class JwtTokenProvider {
     private final long expirationMs;
     private final String issuer;
     private final String algorithm;
+    private final PublicKey publicKey;   // RS256 模式下的公鑰，HS256 為 null
+    private final String keyId;          // JWKS 端點使用的 kid
 
     public JwtTokenProvider(
             @Value("${jwt.algorithm:HS256}") String algorithm,
@@ -56,23 +59,26 @@ public class JwtTokenProvider {
             @Value("${jwt.rsa.public-key-location:}") String publicKeyLocation,
             @Value("${jwt.rsa.private-key-location:}") String privateKeyLocation,
             @Value("${jwt.expiration-ms}") long expirationMs,
-            @Value("${jwt.issuer}") String issuer) {
+            @Value("${jwt.issuer}") String issuer,
+            @Value("${jwt.rsa.key-id:jwt-poc-key-1}") String keyId) {
 
         this.algorithm = algorithm.toUpperCase();
         this.expirationMs = expirationMs;
         this.issuer = issuer;
+        this.keyId = keyId;
 
         if ("RS256".equals(this.algorithm)) {
             // RS256: 私鑰簽名，公鑰驗證
             PrivateKey privateKey = loadPrivateKey(privateKeyLocation);
-            PublicKey publicKey = loadPublicKey(publicKeyLocation);
+            this.publicKey = loadPublicKey(publicKeyLocation);
             this.signingKey = privateKey;
-            this.jwtParser = Jwts.parser().verifyWith(publicKey).build();
+            this.jwtParser = Jwts.parser().verifyWith(this.publicKey).build();
             log.info("JWT configured with RS256 (asymmetric: private key signs, public key verifies)");
         } else {
             // HS256: 同一把密鑰簽名和驗證
             SecretKey hmacKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
             this.signingKey = hmacKey;
+            this.publicKey = null;
             this.jwtParser = Jwts.parser().verifyWith(hmacKey).build();
             log.info("JWT configured with HS256 (symmetric: same key signs and verifies)");
         }
@@ -90,6 +96,7 @@ public class JwtTokenProvider {
         Date expiry = new Date(now.getTime() + expirationMs);
 
         String token = Jwts.builder()
+                .id(UUID.randomUUID().toString())   // jti claim — 用於 Token 黑名單
                 .subject(username)
                 .claim("role", role)
                 .issuer(issuer)
@@ -142,12 +149,40 @@ public class JwtTokenProvider {
         return false;
     }
 
+    /**
+     * 從 Token 中提取 JWT ID (jti claim)
+     */
+    public String getJtiFromToken(String token) {
+        return parseClaims(token).getId();
+    }
+
+    /**
+     * 從 Token 中提取過期時間
+     */
+    public Date getExpirationFromToken(String token) {
+        return parseClaims(token).getExpiration();
+    }
+
     public long getExpirationMs() {
         return expirationMs;
     }
 
     public String getAlgorithm() {
         return algorithm;
+    }
+
+    /**
+     * 取得 RSA 公鑰（RS256 模式），用於 JWKS 端點
+     */
+    public PublicKey getPublicKey() {
+        return publicKey;
+    }
+
+    /**
+     * 取得 Key ID，用於 JWKS 端點的 kid 欄位
+     */
+    public String getKeyId() {
+        return keyId;
     }
 
     private Claims parseClaims(String token) {

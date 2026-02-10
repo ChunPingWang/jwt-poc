@@ -2,6 +2,7 @@ package com.example.jwtpoc.application.service;
 
 import com.example.jwtpoc.application.port.in.TokenRefreshUseCase;
 import com.example.jwtpoc.application.port.out.RefreshTokenRepository;
+import com.example.jwtpoc.application.port.out.TokenBlacklistRepository;
 import com.example.jwtpoc.application.port.out.UserRepository;
 import com.example.jwtpoc.domain.model.RefreshToken;
 import com.example.jwtpoc.domain.model.User;
@@ -34,16 +35,19 @@ public class TokenRefreshService implements TokenRefreshUseCase {
     private final RefreshTokenRepository refreshTokenRepository;
     private final UserRepository userRepository;
     private final JwtTokenProvider jwtTokenProvider;
+    private final TokenBlacklistRepository tokenBlacklistRepository;
     private final long refreshTokenExpirationMs;
 
     public TokenRefreshService(
             RefreshTokenRepository refreshTokenRepository,
             UserRepository userRepository,
             JwtTokenProvider jwtTokenProvider,
+            TokenBlacklistRepository tokenBlacklistRepository,
             @Value("${jwt.refresh-expiration-ms}") long refreshTokenExpirationMs) {
         this.refreshTokenRepository = refreshTokenRepository;
         this.userRepository = userRepository;
         this.jwtTokenProvider = jwtTokenProvider;
+        this.tokenBlacklistRepository = tokenBlacklistRepository;
         this.refreshTokenExpirationMs = refreshTokenExpirationMs;
     }
 
@@ -78,13 +82,25 @@ public class TokenRefreshService implements TokenRefreshUseCase {
     }
 
     @Override
-    public void logout(String refreshTokenStr) {
+    public void logout(String refreshTokenStr, String accessToken) {
+        // 1. 撤銷 Refresh Token
         RefreshToken refreshToken = refreshTokenRepository.findByToken(refreshTokenStr)
                 .orElseThrow(() -> new RuntimeException("Refresh token not found"));
 
         refreshToken.revoke();
         refreshTokenRepository.save(refreshToken);
         log.debug("Refresh token revoked for user: {}", refreshToken.getUsername());
+
+        // 2. 將 Access Token 加入黑名單（解決 JWT stateless 的已知限制）
+        if (accessToken != null && jwtTokenProvider.validateToken(accessToken)) {
+            String jti = jwtTokenProvider.getJtiFromToken(accessToken);
+            long expirationTime = jwtTokenProvider.getExpirationFromToken(accessToken).getTime();
+            long remainingTtl = expirationTime - System.currentTimeMillis();
+            if (remainingTtl > 0) {
+                tokenBlacklistRepository.blacklist(jti, remainingTtl);
+                log.debug("Access token blacklisted: jti={}, remainingTtl={}ms", jti, remainingTtl);
+            }
+        }
     }
 
     /** 建立並儲存新的 Refresh Token */
