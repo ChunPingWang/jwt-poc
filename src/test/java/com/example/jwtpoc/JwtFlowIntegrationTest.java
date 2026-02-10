@@ -49,7 +49,7 @@ class JwtFlowIntegrationTest {
 
     @Test
     @Order(2)
-    @DisplayName("Step 1-4: 登入取得 JWT Token")
+    @DisplayName("Step 1-4: 登入取得 JWT Token 和 Refresh Token")
     void shouldLoginAndGetJwt() throws Exception {
         var request = new LoginRequest("testuser", "password123");
 
@@ -57,14 +57,15 @@ class JwtFlowIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.token").isNotEmpty())
+                .andExpect(jsonPath("$.accessToken").isNotEmpty())
+                .andExpect(jsonPath("$.refreshToken").isNotEmpty())
                 .andExpect(jsonPath("$.tokenType").value("Bearer"))
                 .andExpect(jsonPath("$.username").value("testuser"))
                 .andReturn();
 
         // 儲存 Token 供後續測試使用
         var response = objectMapper.readTree(result.getResponse().getContentAsString());
-        jwtToken = response.get("token").asText();
+        jwtToken = response.get("accessToken").asText();
 
         // 驗證 JWT 結構: header.payload.signature
         String[] parts = jwtToken.split("\\.");
@@ -128,7 +129,7 @@ class JwtFlowIntegrationTest {
                 .andReturn();
 
         var response = objectMapper.readTree(result.getResponse().getContentAsString());
-        String adminToken = response.get("token").asText();
+        String adminToken = response.get("accessToken").asText();
 
         // 使用 Admin Token 存取
         mockMvc.perform(get("/api/protected/admin")

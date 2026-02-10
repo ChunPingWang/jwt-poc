@@ -123,6 +123,10 @@ public class JwtTokenProvider {
         return false;
     }
 
+    public long getExpirationMs() {
+        return expirationMs;
+    }
+
     private Claims parseClaims(String token) {
         return Jwts.parser()
                 .verifyWith(secretKey)

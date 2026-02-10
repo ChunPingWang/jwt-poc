@@ -1,7 +1,9 @@
 package com.example.jwtpoc.application.service;
 
 import com.example.jwtpoc.application.port.in.AuthUseCase;
+import com.example.jwtpoc.application.port.in.LoginResult;
 import com.example.jwtpoc.application.port.out.UserRepository;
+import com.example.jwtpoc.domain.model.RefreshToken;
 import com.example.jwtpoc.domain.model.User;
 import com.example.jwtpoc.infrastructure.security.JwtTokenProvider;
 
@@ -22,23 +24,27 @@ public class AuthService implements AuthUseCase {
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtTokenProvider jwtTokenProvider;
+    private final TokenRefreshService tokenRefreshService;
 
     public AuthService(UserRepository userRepository,
                        PasswordEncoder passwordEncoder,
-                       JwtTokenProvider jwtTokenProvider) {
+                       JwtTokenProvider jwtTokenProvider,
+                       TokenRefreshService tokenRefreshService) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.jwtTokenProvider = jwtTokenProvider;
+        this.tokenRefreshService = tokenRefreshService;
     }
 
     /**
      * 登入流程：
      * 1. 查詢使用者
      * 2. 驗證密碼
-     * 3. 產生 JWT Token
+     * 3. 產生 Access Token (JWT) — stateless
+     * 4. 產生 Refresh Token (UUID) — stateful, 儲存在資料庫
      */
     @Override
-    public String login(String username, String password) {
+    public LoginResult login(String username, String password) {
         User user = userRepository.findByUsername(username)
                 .orElseThrow(() -> new RuntimeException("User not found: " + username));
 
@@ -47,7 +53,17 @@ public class AuthService implements AuthUseCase {
         }
 
         // 產生 JWT — 對應圖中 Step 3: Create & sign JWT
-        return jwtTokenProvider.generateToken(user.getUsername(), user.getRole());
+        String accessToken = jwtTokenProvider.generateToken(user.getUsername(), user.getRole());
+
+        // 產生 Refresh Token — 儲存在資料庫，可撤銷
+        RefreshToken refreshToken = tokenRefreshService.createRefreshToken(user.getUsername());
+
+        return new LoginResult(
+                accessToken,
+                refreshToken.getToken(),
+                user.getUsername(),
+                jwtTokenProvider.getExpirationMs()
+        );
     }
 
     /**

@@ -1,14 +1,13 @@
 package com.example.jwtpoc.adapter.in.web;
 
-import com.example.jwtpoc.adapter.in.web.dto.LoginRequest;
-import com.example.jwtpoc.adapter.in.web.dto.LoginResponse;
-import com.example.jwtpoc.adapter.in.web.dto.UserRegistrationRequest;
+import com.example.jwtpoc.adapter.in.web.dto.*;
 import com.example.jwtpoc.application.port.in.AuthUseCase;
+import com.example.jwtpoc.application.port.in.LoginResult;
+import com.example.jwtpoc.application.port.in.TokenRefreshUseCase;
 import com.example.jwtpoc.domain.model.User;
 
 import jakarta.validation.Valid;
 
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -29,12 +28,12 @@ import java.util.Map;
 public class AuthController {
 
     private final AuthUseCase authUseCase;
-    private final long expirationMs;
+    private final TokenRefreshUseCase tokenRefreshUseCase;
 
     public AuthController(AuthUseCase authUseCase,
-                          @Value("${jwt.expiration-ms}") long expirationMs) {
+                          TokenRefreshUseCase tokenRefreshUseCase) {
         this.authUseCase = authUseCase;
-        this.expirationMs = expirationMs;
+        this.tokenRefreshUseCase = tokenRefreshUseCase;
     }
 
     /**
@@ -43,14 +42,17 @@ public class AuthController {
      * 對應圖中 Step 1-4:
      *   1. User sends credentials
      *   2. Server authenticates
-     *   3. Server creates & signs JWT
-     *   4. Server returns JWT to client
+     *   3. Server creates & signs JWT + Refresh Token
+     *   4. Server returns both tokens to client
      */
     @PostMapping("/login")
     public ResponseEntity<LoginResponse> login(@Valid @RequestBody LoginRequest request) {
-        String token = authUseCase.login(request.username(), request.password());
-        return ResponseEntity.ok(
-                new LoginResponse(token, request.username(), expirationMs));
+        LoginResult result = authUseCase.login(request.username(), request.password());
+        return ResponseEntity.ok(new LoginResponse(
+                result.accessToken(),
+                result.refreshToken(),
+                result.username(),
+                result.accessTokenExpiresInMs()));
     }
 
     /**
@@ -67,5 +69,38 @@ public class AuthController {
                         "username", user.getUsername(),
                         "role", user.getRole()
                 ));
+    }
+
+    /**
+     * POST /api/auth/refresh
+     *
+     * Token Rotation 流程：
+     * 1. Client 送出 Refresh Token
+     * 2. Server 驗證 Refresh Token（是否存在、未過期、未撤銷）
+     * 3. Server 撤銷舊 Refresh Token
+     * 4. Server 產生新的 Access Token + Refresh Token
+     * 5. Server 回傳新的 Token 對
+     */
+    @PostMapping("/refresh")
+    public ResponseEntity<LoginResponse> refresh(@Valid @RequestBody RefreshTokenRequest request) {
+        TokenRefreshUseCase.TokenPair pair = tokenRefreshUseCase.refresh(request.refreshToken());
+        return ResponseEntity.ok(new LoginResponse(
+                pair.accessToken(),
+                pair.refreshToken(),
+                null,
+                pair.accessTokenExpiresInMs()));
+    }
+
+    /**
+     * POST /api/auth/logout
+     *
+     * 撤銷 Refresh Token，使其無法再用來取得新的 Access Token。
+     * 注意：已發出的 Access Token (JWT) 仍然有效直到過期，
+     * 因為 JWT 是 stateless 的。這是 JWT 架構的已知限制。
+     */
+    @PostMapping("/logout")
+    public ResponseEntity<Map<String, String>> logout(@Valid @RequestBody LogoutRequest request) {
+        tokenRefreshUseCase.logout(request.refreshToken());
+        return ResponseEntity.ok(Map.of("message", "Logged out successfully"));
     }
 }

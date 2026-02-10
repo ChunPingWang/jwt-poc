@@ -9,9 +9,9 @@ import com.example.jwtpoc.domain.model.User;
 public interface AuthUseCase {
 
     /**
-     * 使用者登入，回傳 JWT Token
+     * 使用者登入，回傳 Access Token + Refresh Token
      */
-    String login(String username, String password);
+    LoginResult login(String username, String password);
 
     /**
      * 使用者註冊
