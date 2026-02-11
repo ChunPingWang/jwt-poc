@@ -12,12 +12,17 @@
 4. [HS256 vs RS256 簽章演算法](#hs256-vs-rs256-簽章演算法)
 5. [認證流程圖解](#認證流程圖解)
 6. [Refresh Token 機制](#refresh-token-機制)
-7. [專案架構總覽](#專案架構總覽)
-8. [核心程式碼逐行解說](#核心程式碼逐行解說)
-9. [環境需求與啟動方式](#環境需求與啟動方式)
-10. [API 測試教學（手把手）](#api-測試教學手把手)
-11. [常見問題 FAQ](#常見問題-faq)
-12. [延伸學習資源](#延伸學習資源)
+7. [進階功能](#進階功能)
+   - [Rate Limiting（速率限制）](#rate-limiting速率限制)
+   - [Token Blacklist（黑名單）](#token-blacklist黑名單)
+   - [JWKS 端點](#jwks-端點)
+   - [OAuth 2.0 Resource Server](#oauth-20-resource-server)
+8. [專案架構總覽](#專案架構總覽)
+9. [核心程式碼逐行解說](#核心程式碼逐行解說)
+10. [環境需求與啟動方式](#環境需求與啟動方式)
+11. [API 測試教學（手把手）](#api-測試教學手把手)
+12. [常見問題 FAQ](#常見問題-faq)
+13. [延伸學習資源](#延伸學習資源)
 
 ---
 
@@ -105,11 +110,12 @@ eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJyZXgiLCJyb2xlIjoiQURNSU4ifQ.xxxS
 
 ```json
 {
-  "sub": "rex",           // Subject：使用者名稱
-  "role": "ADMIN",        // 自訂聲明：角色
-  "iss": "jwt-poc-app",   // Issuer：簽發者
-  "iat": 1700000000,      // Issued At：簽發時間
-  "exp": 1700003600       // Expiration：過期時間
+  "jti": "550e8400-...",   // JWT ID：唯一識別碼（Token 黑名單用）
+  "sub": "rex",            // Subject：使用者名稱
+  "role": "ADMIN",         // 自訂聲明：角色
+  "iss": "jwt-poc-app",    // Issuer：簽發者
+  "iat": 1700000000,       // Issued At：簽發時間
+  "exp": 1700003600        // Expiration：過期時間
 }
 ```
 
@@ -376,21 +382,190 @@ stateDiagram-v2
     note right of Revoked : 已被撤銷，無法使用
 ```
 
-### 登出的限制
+### 登出流程
 
 ```mermaid
 graph TD
-    LOGOUT["POST /api/auth/logout"] --> REVOKE["撤銷 Refresh Token ✅"]
-    LOGOUT --> NOTE["已發出的 Access Token<br/>仍然有效直到過期 ⚠️"]
+    LOGOUT["POST /api/auth/logout<br/>+ Authorization: Bearer JWT"] --> REVOKE["撤銷 Refresh Token ✅"]
+    LOGOUT --> BLACKLIST["Access Token 加入黑名單 ✅"]
 
-    NOTE --> REASON["因為 JWT 是 stateless 的<br/>伺服器不追蹤已發出的 JWT"]
-    REASON --> SOLUTION["解決方案：設定較短的<br/>Access Token 有效期"]
+    BLACKLIST --> DETAIL["JwtAuthenticationFilter 檢查黑名單<br/>已撤銷的 Token 無法通過驗證"]
+    BLACKLIST --> TTL["黑名單條目的 TTL = Token 剩餘有效期<br/>過期後自動清理，不佔用記憶體"]
 
     style REVOKE fill:#4ade80,color:#000
-    style NOTE fill:#fbbf24,color:#000
-    style REASON fill:#f8fafc,color:#000
-    style SOLUTION fill:#38bdf8,color:#fff
+    style BLACKLIST fill:#4ade80,color:#000
+    style DETAIL fill:#f0fdf4,color:#14532d
+    style TTL fill:#f0fdf4,color:#14532d
 ```
+
+> Token Blacklist 解決了 JWT stateless 的已知限制。詳見 [Token Blacklist（黑名單）](#token-blacklist黑名單) 章節。
+
+---
+
+## 進階功能
+
+本專案實作了 4 項 JWT 安全進階功能，展示真實世界的 JWT 安全模式。
+
+### Rate Limiting（速率限制）
+
+防止暴力破解登入攻擊，按 IP 地址限制登入嘗試次數。
+
+```mermaid
+sequenceDiagram
+    participant C as 🖥️ Client
+    participant RL as 🚦 RateLimitFilter
+    participant S as 🔐 Server
+
+    C->>RL: POST /api/auth/login (第 1~5 次)
+    RL->>S: 未超過限制，放行
+    S-->>C: 200 OK / 401 Unauthorized
+
+    C->>RL: POST /api/auth/login (第 6 次)
+    RL-->>C: 429 Too Many Requests<br/>Retry-After: 900
+```
+
+**設計要點**：
+- **滑動窗口演算法**：使用 `ConcurrentHashMap<IP, Deque<Timestamp>>` 記錄請求時間
+- **僅套用於登入端點**：`shouldNotFilter()` 確保其他 API 不受影響
+- **IP 提取**：優先使用 `X-Forwarded-For`（反向代理場景），否則用 `remoteAddr`
+- **可配置**：透過 `rate-limit.max-attempts`（預設 5 次）和 `rate-limit.window-ms`（預設 15 分鐘）
+
+```properties
+# application.properties
+rate-limit.max-attempts=5
+rate-limit.window-ms=900000
+```
+
+> 生產環境建議使用 Redis + Lua Script 實現分散式速率限制。
+
+---
+
+### Token Blacklist（黑名單）
+
+解決 JWT stateless 的已知限制：登出時將 Access Token 加入黑名單，使其立即失效。
+
+```mermaid
+sequenceDiagram
+    participant C as 🖥️ Client
+    participant F as 🔍 JwtAuthFilter
+    participant BL as 🚫 Blacklist
+    participant S as 🔐 Server
+
+    Note over C,S: 登出流程
+    C->>S: POST /api/auth/logout<br/>Authorization: Bearer JWT
+    S->>S: 撤銷 Refresh Token
+    S->>BL: 加入黑名單<br/>(jti, 剩餘TTL)
+    S-->>C: 200 Logged out
+
+    Note over C,S: 登出後存取
+    C->>F: GET /api/protected/profile<br/>Authorization: Bearer JWT
+    F->>BL: 檢查 jti 是否在黑名單？
+    BL-->>F: 是 → 已撤銷
+    F-->>C: 403 Forbidden
+```
+
+**設計要點**：
+- **jti Claim**：每個 JWT 包含唯一的 `jti`（JWT ID，UUID），用於識別 Token
+- **TTL 自動過期**：黑名單條目的存活時間 = Token 的剩餘有效期，過期後自動清理
+- **In-Memory 儲存**：`ConcurrentHashMap<jti, expiryTimestamp>` + `ScheduledExecutorService` 定期清理
+- **六角形架構**：`TokenBlacklistRepository`（出站埠）→ `InMemoryTokenBlacklistAdapter`（適配器）
+
+```mermaid
+graph LR
+    JWT["JWT Token"] --> JTI["jti: uuid-abc-123"]
+    JTI --> CHECK{"在黑名單中？"}
+    CHECK -->|否| AUTH["設定 SecurityContext ✅"]
+    CHECK -->|是| REJECT["跳過認證 ❌"]
+
+    style JWT fill:#38bdf8,color:#fff
+    style AUTH fill:#4ade80,color:#000
+    style REJECT fill:#f87171,color:#fff
+```
+
+> 生產環境建議替換為 Redis 實現（`SET jti EX ttl`），支援分散式部署。
+
+---
+
+### JWKS 端點
+
+**JWKS（JSON Web Key Set）** 是 OpenID Connect / OAuth 2.0 的標準協議，讓資源伺服器可以動態取得簽名公鑰。
+
+```mermaid
+sequenceDiagram
+    participant RS as 🔐 Resource Server
+    participant JWKS as 📋 JWKS Endpoint
+    participant AS as 🏛️ Auth Server
+
+    RS->>JWKS: GET /.well-known/jwks.json
+    JWKS-->>RS: {"keys": [{"kty":"RSA", "kid":"jwt-poc-key-1", ...}]}
+    RS->>RS: 使用公鑰驗證 JWT 簽名
+```
+
+**端點**：`GET /.well-known/jwks.json`
+
+- **RS256 模式**：回傳 JWK Set JSON，包含 RSA 公鑰的 `kid`、`kty`、`use`、`alg`、`n`、`e` 欄位
+- **HS256 模式**：回傳說明訊息（JWKS 需要非對稱金鑰）
+- **公開存取**：不需要認證即可取得
+
+回應範例（RS256 模式）：
+```json
+{
+  "keys": [{
+    "kty": "RSA",
+    "use": "sig",
+    "alg": "RS256",
+    "kid": "jwt-poc-key-1",
+    "n": "0vx7agoebGcQSuu...",
+    "e": "AQAB"
+  }]
+}
+```
+
+> JWKS 使用 [Nimbus JOSE+JWT](https://connect2id.com/products/nimbus-jose-jwt) 函式庫將 `RSAPublicKey` 轉換為標準 JWK 格式。
+
+---
+
+### OAuth 2.0 Resource Server
+
+展示標準 Spring Security OAuth 2.0 Resource Server 模式，透過 `@Profile("oauth2")` 啟用。
+
+```mermaid
+graph TB
+    subgraph DEFAULT["預設模式（自訂 Filter）"]
+        direction LR
+        REQ1["Request"] --> RATE1["RateLimitFilter"]
+        RATE1 --> JWT1["JwtAuthenticationFilter<br/>手動提取 & 驗證 JWT<br/>手動建立 Authentication"]
+        JWT1 --> CTRL1["Controller"]
+    end
+
+    subgraph OAUTH2["OAuth2 模式（Spring 標準）"]
+        direction LR
+        REQ2["Request"] --> RATE2["RateLimitFilter"]
+        RATE2 --> SPRING["Spring OAuth2<br/>BearerTokenAuthFilter<br/>自動提取 & 驗證 JWT"]
+        SPRING --> CONV["CustomJwtAuthConverter<br/>role → ROLE_xxx"]
+        CONV --> CTRL2["Controller"]
+    end
+
+    style DEFAULT fill:#dbeafe,color:#000
+    style OAUTH2 fill:#dcfce7,color:#000
+```
+
+**啟動方式**：
+```bash
+mvn spring-boot:run -Dspring-boot.run.profiles=oauth2
+```
+
+**與預設模式的對比**：
+
+| 比較 | 預設模式（自訂 Filter） | OAuth2 模式 |
+|------|----------------------|-------------|
+| JWT 提取 | 手動從 Header 取得 | Spring 自動處理 |
+| JWT 驗證 | 手動呼叫 JJWT | Spring + Nimbus 自動處理 |
+| Claim 映射 | 手動建立 Authentication | `CustomJwtAuthenticationConverter` |
+| 演算法 | HS256 / RS256 | RS256（強制非對稱金鑰） |
+| 適用場景 | 學習 JWT 底層運作 | 生產環境、標準 OAuth 2.0 整合 |
+
+> OAuth2 模式使用本地 RSA 公鑰建立 `JwtDecoder`。生產環境中 Resource Server 會透過 `jwkSetUri` 從外部 Authorization Server 取得公鑰。
 
 ---
 
@@ -407,10 +582,11 @@ graph TB
     subgraph ADAPTER["🔌 Adapter 層（與外部世界溝通）"]
         direction LR
         subgraph IN_ADAPTER["入站適配器"]
-            WEB["AuthController<br/>ProtectedController<br/>DTOs"]
+            WEB["AuthController<br/>ProtectedController<br/>JwksController<br/>DTOs"]
         end
         subgraph OUT_ADAPTER["出站適配器"]
             PERSIST["UserPersistenceAdapter<br/>RefreshTokenPersistenceAdapter<br/>JPA Entities"]
+            CACHE["InMemoryTokenBlacklistAdapter"]
         end
     end
 
@@ -423,6 +599,7 @@ graph TB
         subgraph OUT_PORT["出站埠"]
             USER_REPO["UserRepository"]
             TOKEN_REPO["RefreshTokenRepository"]
+            BL_REPO["TokenBlacklistRepository"]
         end
     end
 
@@ -437,9 +614,10 @@ graph TB
     end
 
     subgraph INFRA["🏗️ Infrastructure 層（技術實作）"]
-        SEC["SecurityConfig"]
-        JWT["JwtTokenProvider"]
+        SEC["SecurityConfig<br/>OAuth2ResourceServerConfig"]
+        JWT["JwtTokenProvider<br/>JwkProvider"]
         FILTER["JwtAuthenticationFilter"]
+        RATE["RateLimitFilter<br/>RateLimiter"]
     end
 
     WEB --> AUTH_UC & REFRESH_UC
@@ -447,9 +625,10 @@ graph TB
     REFRESH_UC --> TOKEN_SVC
     AUTH_SVC --> USER_REPO & TOKEN_SVC
     AUTH_SVC --> JWT
-    TOKEN_SVC --> TOKEN_REPO & USER_REPO & JWT
+    TOKEN_SVC --> TOKEN_REPO & USER_REPO & JWT & BL_REPO
     USER_REPO --> PERSIST
     TOKEN_REPO --> PERSIST
+    BL_REPO --> CACHE
     AUTH_SVC -.-> USER & RTOKEN
     TOKEN_SVC -.-> USER & RTOKEN
 
@@ -463,7 +642,8 @@ graph TB
 
 ```mermaid
 graph LR
-    REQ["HTTP Request"] --> FILTER["JwtAuthenticationFilter<br/>(提取 & 驗證 JWT)"]
+    REQ["HTTP Request"] --> RATE["RateLimitFilter<br/>(速率限制)"]
+    RATE --> FILTER["JwtAuthenticationFilter<br/>(提取 & 驗證 JWT<br/>+ 檢查黑名單)"]
     FILTER --> SC["SecurityConfig<br/>(路由授權)"]
     SC --> CTRL["Controller<br/>(入站適配器)"]
     CTRL --> PORT["Use Case Port<br/>(入站埠)"]
@@ -473,6 +653,7 @@ graph LR
     ADAPTER --> DB["H2 Database"]
 
     style REQ fill:#64748b,color:#fff
+    style RATE fill:#fef3c7,color:#000
     style FILTER fill:#dcfce7,color:#000
     style SC fill:#dcfce7,color:#000
     style CTRL fill:#f3e8ff,color:#000
@@ -488,6 +669,7 @@ graph LR
 ```
 src/main/resources/
 ├── application.properties              # 設定檔（含 jwt.algorithm 切換）
+├── application-oauth2.properties       # OAuth2 Profile 專用設定
 └── keys/                               # RSA 金鑰對（PoC 用）
     ├── private.pem                     #   RSA 私鑰（PKCS#8 PEM）
     └── public.pem                      #   RSA 公鑰（X.509 PEM）
@@ -508,15 +690,17 @@ src/main/java/com/example/jwtpoc/
 │   │   │   └── LoginResult.java        #   登入結果（含雙 Token）
 │   │   └── out/
 │   │       ├── UserRepository.java     #   出站埠：使用者資料存取
-│   │       └── RefreshTokenRepository.java # 出站埠：Refresh Token 存取
+│   │       ├── RefreshTokenRepository.java # 出站埠：Refresh Token 存取
+│   │       └── TokenBlacklistRepository.java # 出站埠：Token 黑名單
 │   └── service/
 │       ├── AuthService.java            #   認證服務：登入 / 註冊
-│       └── TokenRefreshService.java    #   Token 服務：更新 / 登出
+│       └── TokenRefreshService.java    #   Token 服務：更新 / 登出 / 黑名單
 │
 ├── adapter/                            # 【適配器層】與外部世界溝通
 │   ├── in/web/                         #   入站適配器（HTTP 請求）
 │   │   ├── AuthController.java         #     登入 / 註冊 / 更新 / 登出 API
 │   │   ├── ProtectedController.java    #     受保護資源 API
+│   │   ├── JwksController.java         #     JWKS 端點 (/.well-known/jwks.json)
 │   │   ├── GlobalExceptionHandler.java #     全域例外處理
 │   │   └── dto/                        #     資料傳輸物件
 │   │       ├── LoginRequest.java       #       登入請求
@@ -524,19 +708,28 @@ src/main/java/com/example/jwtpoc/
 │   │       ├── RefreshTokenRequest.java#       Token 更新請求
 │   │       ├── LogoutRequest.java      #       登出請求
 │   │       └── UserRegistrationRequest.java  # 註冊請求
-│   └── out/persistence/                #   出站適配器（資料庫）
-│       ├── UserEntity.java             #     使用者 JPA Entity
-│       ├── UserJpaRepository.java      #     使用者 Spring Data JPA
-│       ├── UserPersistenceAdapter.java #     使用者 Domain ↔ Entity 轉換
-│       ├── RefreshTokenEntity.java     #     Refresh Token JPA Entity
-│       ├── RefreshTokenJpaRepository.java  # Refresh Token Spring Data JPA
-│       └── RefreshTokenPersistenceAdapter.java # Refresh Token Domain ↔ Entity
+│   └── out/
+│       ├── persistence/                #   出站適配器（資料庫）
+│       │   ├── UserEntity.java         #     使用者 JPA Entity
+│       │   ├── UserJpaRepository.java  #     使用者 Spring Data JPA
+│       │   ├── UserPersistenceAdapter.java  # 使用者 Domain ↔ Entity 轉換
+│       │   ├── RefreshTokenEntity.java      # Refresh Token JPA Entity
+│       │   ├── RefreshTokenJpaRepository.java   # Refresh Token Spring Data JPA
+│       │   └── RefreshTokenPersistenceAdapter.java  # Refresh Token Domain ↔ Entity
+│       └── cache/                      #   出站適配器（快取）
+│           └── InMemoryTokenBlacklistAdapter.java   # Token 黑名單 In-Memory 實現
 │
 └── infrastructure/                     # 【基礎設施層】技術實作
-    └── security/
-        ├── SecurityConfig.java         #   Spring Security 配置
-        ├── JwtTokenProvider.java       #   JWT 產生 / 驗證 / 解析（HS256 + RS256）
-        └── JwtAuthenticationFilter.java#   JWT 請求過濾器
+    ├── security/
+    │   ├── SecurityConfig.java         #   Spring Security 配置（預設模式）
+    │   ├── OAuth2ResourceServerConfig.java  # OAuth 2.0 RS 配置（oauth2 模式）
+    │   ├── CustomJwtAuthenticationConverter.java  # OAuth2 role→authority 映射
+    │   ├── JwtTokenProvider.java       #   JWT 產生 / 驗證 / 解析（HS256 + RS256）
+    │   ├── JwtAuthenticationFilter.java#   JWT 請求過濾器（含黑名單檢查）
+    │   └── JwkProvider.java            #   RSA 公鑰 → JWK Set 轉換
+    └── ratelimit/
+        ├── RateLimiter.java            #   滑動窗口速率限制演算法
+        └── RateLimitFilter.java        #   登入端點速率限制過濾器
 ```
 
 ---
@@ -565,6 +758,7 @@ if ("RS256".equals(algorithm)) {
 // 產生 JWT Token — .signWith() 根據 Key 類型自動選擇演算法
 public String generateToken(String username, String role) {
     return Jwts.builder()
+            .id(UUID.randomUUID().toString()) // 設定 jti（Token 黑名單用）
             .subject(username)              // 設定 Payload 的 sub（主體）
             .claim("role", role)             // 設定自訂聲明：角色
             .issuer(issuer)                  // 設定 Payload 的 iss（簽發者）
@@ -608,26 +802,30 @@ protected void doFilterInternal(HttpServletRequest request,
                                 FilterChain filterChain) {
 
     // 第一步：從 Authorization Header 中提取 Token
-    // 格式：Authorization: Bearer eyJhbGci...
     String token = extractToken(request);
 
     // 第二步：驗證 Token 是否有效
     if (token != null && jwtTokenProvider.validateToken(token)) {
 
-        // 第三步：從 Token 中取出使用者資訊
-        String username = jwtTokenProvider.getUsernameFromToken(token);
-        String role = jwtTokenProvider.getRoleFromToken(token);
+        // 第三步：檢查 Token 是否已被列入黑名單（登出後撤銷）
+        String jti = jwtTokenProvider.getJtiFromToken(token);
+        if (jti != null && tokenBlacklistRepository.isBlacklisted(jti)) {
+            // 已撤銷的 Token → 跳過認證
+        } else {
+            // 第四步：從 Token 中取出使用者資訊
+            String username = jwtTokenProvider.getUsernameFromToken(token);
+            String role = jwtTokenProvider.getRoleFromToken(token);
 
-        // 第四步：建立 Spring Security 的認證物件
-        var authorities = List.of(new SimpleGrantedAuthority("ROLE_" + role));
-        var authentication = new UsernamePasswordAuthenticationToken(
-                username, null, authorities);
+            // 第五步：建立 Spring Security 的認證物件
+            var authorities = List.of(new SimpleGrantedAuthority("ROLE_" + role));
+            var authentication = new UsernamePasswordAuthenticationToken(
+                    username, null, authorities);
 
-        // 第五步：放入 SecurityContext，後續的 Controller 就能取得使用者資訊
-        SecurityContextHolder.getContext().setAuthentication(authentication);
+            // 第六步：放入 SecurityContext
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+        }
     }
 
-    // 繼續處理下一個 Filter
     filterChain.doFilter(request, response);
 }
 ```
@@ -635,6 +833,7 @@ protected void doFilterInternal(HttpServletRequest request,
 **初學者重點**：
 - `OncePerRequestFilter` 確保每個請求只執行一次
 - 提取 Token 時會去掉 `Bearer ` 前綴
+- **黑名單檢查**：驗證簽章後還需檢查 `jti` 是否在黑名單中，解決登出後 Token 仍有效的問題
 - 放入 `SecurityContext` 後，Controller 就能用 `Authentication auth` 參數取得使用者
 
 ### 3. Spring Security 配置 — `SecurityConfig.java`
@@ -650,12 +849,16 @@ http
 
     // 設定哪些路徑需要認證
     .authorizeHttpRequests(auth -> auth
-        .requestMatchers("/api/auth/**").permitAll()           // 登入、註冊、更新、登出：公開
+        .requestMatchers("/api/auth/**").permitAll()           // 登入、註冊：公開
+        .requestMatchers("/.well-known/**").permitAll()        // JWKS 端點：公開
         .requestMatchers("/api/protected/admin/**").hasRole("ADMIN")  // 管理員限定
         .anyRequest().authenticated()                          // 其他：需認證
     )
 
-    // 在預設的帳密認證過濾器之前，插入我們的 JWT 過濾器
+    // 速率限制過濾器（防暴力破解登入）
+    .addFilterBefore(rateLimitFilter, UsernamePasswordAuthenticationFilter.class)
+
+    // JWT 認證過濾器（含黑名單檢查）
     .addFilterBefore(jwtAuthenticationFilter,
             UsernamePasswordAuthenticationFilter.class);
 ```
@@ -790,10 +993,20 @@ mvn spring-boot:run -Djwt.algorithm=RS256
 # 或直接修改 application.properties 中的 jwt.algorithm=RS256
 ```
 
+### 使用 OAuth 2.0 Resource Server 模式
+
+```bash
+# 啟用 oauth2 Profile（強制使用 RS256）
+mvn spring-boot:run -Dspring-boot.run.profiles=oauth2
+```
+
+此模式下 Spring Security 自動處理 JWT 驗證，不使用自訂的 `JwtAuthenticationFilter`。詳見 [OAuth 2.0 Resource Server](#oauth-20-resource-server) 章節。
+
 ### 執行測試
 
 ```bash
 ./mvnw test
+# 54 tests, 0 failures
 ```
 
 ---
@@ -811,13 +1024,15 @@ graph TD
     B --> D["步驟 4<br/>存取受保護資源"]
     D --> E["步驟 5<br/>測試權限控制"]
     B --> F["步驟 6<br/>Token 更新"]
-    F --> G["步驟 7<br/>登出"]
-    G --> H["步驟 8<br/>測試異常情境"]
+    F --> G["步驟 7<br/>登出 + 黑名單"]
+    G --> H["步驟 8<br/>測試 JWKS 端點"]
+    H --> I["步驟 9<br/>測試異常情境"]
 
     style A fill:#4ade80,color:#000
     style B fill:#38bdf8,color:#fff
     style F fill:#a78bfa,color:#fff
     style G fill:#fb923c,color:#fff
+    style H fill:#a78bfa,color:#fff
 ```
 
 ### 步驟 1：註冊使用者
@@ -899,7 +1114,7 @@ echo $TOKEN | cut -d'.' -f2 | base64 -d 2>/dev/null && echo
 你會看到類似的輸出（演算法取決於 `jwt.algorithm` 設定）：
 ```json
 {"alg":"HS256"}
-{"sub":"alice","role":"USER","iss":"jwt-poc-app","iat":1700000000,"exp":1700003600}
+{"jti":"550e8400-...","sub":"alice","role":"USER","iss":"jwt-poc-app","iat":1700000000,"exp":1700003600}
 ```
 
 > 這證明了 Payload 並不是加密的！任何人拿到 Token 都可以看到內容。但因為沒有密鑰，無法偽造簽章。
@@ -990,9 +1205,10 @@ export REFRESH_TOKEN=$(echo $NEW_RESPONSE | jq -r '.refreshToken')
 ### 步驟 7：登出
 
 ```bash
-# 使用 Refresh Token 登出
+# 登出：撤銷 Refresh Token + 將 Access Token 加入黑名單
 curl -s -X POST http://localhost:8080/api/auth/logout \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d "{\"refreshToken\":\"$REFRESH_TOKEN\"}" | jq .
 ```
 
@@ -1003,7 +1219,27 @@ curl -s -X POST http://localhost:8080/api/auth/logout \
 }
 ```
 
-### 步驟 8：測試異常情境
+> 帶上 `Authorization` header 可讓伺服器將 Access Token 加入黑名單。不帶也能登出（僅撤銷 Refresh Token）。
+
+```bash
+# 驗證：登出後 Access Token 應被拒絕（黑名單生效）
+curl -s -o /dev/null -w "登出後存取: HTTP %{http_code}\n" \
+  http://localhost:8080/api/protected/profile \
+  -H "Authorization: Bearer $TOKEN"
+# 預期：HTTP 403
+```
+
+### 步驟 8：測試 JWKS 端點
+
+```bash
+# 取得 JWKS（HS256 模式會回傳說明訊息）
+curl -s http://localhost:8080/.well-known/jwks.json | jq .
+
+# 如果使用 RS256 模式，會回傳 JWK Set：
+# {"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"jwt-poc-key-1","n":"...","e":"AQAB"}]}
+```
+
+### 步驟 9：測試異常情境
 
 ```bash
 # 8a. 不帶 Token 直接存取 → 403
@@ -1037,10 +1273,12 @@ curl -s -X POST http://localhost:8080/api/auth/refresh \
 
 ### Q1: JWT Token 被偷了怎麼辦？
 
-這確實是 JWT 的一個弱點。由於伺服器不儲存狀態，無法直接「撤銷」一個 Access Token。本專案的解決方案：
+本專案提供了多層防護：
+- **Token Blacklist**：登出時將 Access Token 加入黑名單，使其立即失效（本專案已實作）
 - **Access Token 設定較短的過期時間**（1 小時）
 - **搭配 Refresh Token 機制**（本專案已實作）
 - **Refresh Token 可以被撤銷**（透過登出或 Token Rotation）
+- **Rate Limiting**：防止暴力破解取得 Token（本專案已實作）
 - **使用 HTTPS** 防止 Token 在傳輸中被截取
 
 ### Q2: 為什麼不能在 Payload 中放密碼？
@@ -1094,15 +1332,23 @@ H2 是一個嵌入式的記憶體資料庫，專案啟動時自動建立，關�
 ### 使用的技術
 - [Spring Boot 3.3](https://spring.io/projects/spring-boot) — Java Web 框架
 - [Spring Security](https://spring.io/projects/spring-security) — 安全框架
+- [Spring OAuth2 Resource Server](https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/) — OAuth 2.0 資源伺服器
 - [JJWT](https://github.com/jwtk/jjwt) — Java JWT 函式庫
+- [Nimbus JOSE+JWT](https://connect2id.com/products/nimbus-jose-jwt) — JWKS / JWK 處理
 - [H2 Database](https://www.h2database.com/) — 嵌入式記憶體資料庫
 - [Lombok](https://projectlombok.org/) — Java 程式碼簡化工具
 
-### 進階主題
-- **OAuth 2.0**：更完整的授權框架
-- **Token 黑名單**：搭配 Redis 實作 Access Token 撤銷
-- **Rate Limiting**：防止暴力破解登入
-- **JWKS (JSON Web Key Set)**：動態公鑰分發機制
+### 本專案已實作的進階主題
+- **Rate Limiting**：滑動窗口演算法限制登入嘗試（詳見 [Rate Limiting](#rate-limiting速率限制)）
+- **Token Blacklist**：In-Memory 實現 Access Token 撤銷（詳見 [Token Blacklist](#token-blacklist黑名單)）
+- **JWKS 端點**：動態公鑰分發機制（詳見 [JWKS 端點](#jwks-端點)）
+- **OAuth 2.0 Resource Server**：標準 Spring Security OAuth2 模式（詳見 [OAuth 2.0 RS](#oauth-20-resource-server)）
+
+### 可進一步探索的主題
+- **Redis Token Blacklist**：替換 In-Memory 為 Redis，支援分散式部署
+- **OAuth 2.0 Authorization Server**：完整的 OAuth2 授權伺服器
+- **OpenID Connect (OIDC)**：在 OAuth2 基礎上加入身份驗證
+- **mTLS**：雙向 TLS 認證
 
 ---
 
